@@ -1,5 +1,5 @@
 
-name: Avenix Trip Auto Publisher
+name: Avenix Trip AI Auto Publisher
 
 on:
   workflow_dispatch:
@@ -16,6 +16,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -31,18 +32,18 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Check article generator
-        run: |
-          echo "Repository is ready for the Avenix Trip article generator."
-          echo "AI generation will be connected in the next setup step."
+      - name: Generate AI travel articles
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: node generate-posts.js
 
-      - name: Build blog
+      - name: Build blog website
         run: npm run build
 
-      - name: Commit generated site files
+      - name: Commit and push generated articles
         run: |
           git config user.name "Avenix Trip Bot"
           git config user.email "bot@users.noreply.github.com"
-          git add .
-          git diff --cached --quiet || git commit -m "Automated Avenix Trip blog update"
+          git add -A
+          git diff --cached --quiet || git commit -m "Publish AI-generated travel articles"
           git push
