@@ -2,18 +2,16 @@
 const fs = require("fs");
 const path = require("path");
 
-const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-3.8-flash";
-
-const API_URL =
-  `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+const API_KEY = process.env.OPENROUTER_API_KEY;
+const API_URL = "https://openrouter.ai/api/v1/chat/completions";
+const MODEL = "openrouter/free";
 
 const DAILY_POSTS = 20;
-const ROOT = process.cwd();
-
-const MAX_ATTEMPTS = 6;
+const MAX_ATTEMPTS = 2;
 const REQUEST_TIMEOUT = 180000;
 const MIN_REQUEST_GAP = 8000;
+
+const ROOT = process.cwd();
 
 const CATEGORIES = [
   "flight-guides",
@@ -23,7 +21,7 @@ const CATEGORIES = [
 ];
 
 if (!API_KEY) {
-  throw new Error("GEMINI_API_KEY is missing in GitHub Secrets.");
+  throw new Error("OPENROUTER_API_KEY is missing in GitHub Secrets.");
 }
 
 const sleep = ms =>
@@ -44,14 +42,12 @@ function getMarkdownFiles(dir) {
   for (const item of fs.readdirSync(dir, {
     withFileTypes: true
   })) {
-    if (
-      item.name === ".git" ||
-      item.name === "node_modules" ||
-      item.name === "dist" ||
-      item.name === ".github"
-    ) {
-      continue;
-    }
+    if ([
+      ".git",
+      "node_modules",
+      "dist",
+      ".github"
+    ].includes(item.name)) continue;
 
     const full = path.join(dir, item.name);
 
@@ -69,15 +65,11 @@ function getMarkdownFiles(dir) {
 }
 
 function getExistingTitles() {
-  const files = getMarkdownFiles(ROOT);
   const titles = [];
 
-  for (const file of files) {
+  for (const file of getMarkdownFiles(ROOT)) {
     const content = fs.readFileSync(file, "utf8");
-
-    const match = content.match(
-      /^title:\s*["']?(.*?)["']?\s*$/m
-    );
+    const match = content.match(/^title:\s*["']?(.*?)["']?\s*$/m);
 
     if (match) {
       titles.push(match[1].replace(/["']/g, "").trim());
@@ -98,24 +90,39 @@ function getExistingSlugs() {
   );
 }
 
-let lastRequestAt = 0;
+function extractJson(text) {
+  let cleaned = String(text || "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
 
-function isTemporaryError(error) {
-  const message = String(error?.message || "");
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
 
-  return (
-    error?.name === "AbortError" ||
-    error?.name === "TimeoutError" ||
-    message.includes("fetch failed") ||
-    message.includes("Headers Timeout") ||
-    message.includes("UND_ERR") ||
-    message.includes("ECONNRESET") ||
-    message.includes("ETIMEDOUT") ||
-    message.includes("EAI_AGAIN")
-  );
+  if (start < 0 || end <= start) {
+    throw new Error("AI response did not contain valid JSON.");
+  }
+
+  return JSON.parse(cleaned.slice(start, end + 1));
 }
 
-async function callGemini(prompt, schema, maxTokens = 5000) {
+function getMessageContent(data) {
+  const content = data.choices?.[0]?.message?.content;
+
+  if (typeof content === "string") return content;
+
+  if (Array.isArray(content)) {
+    return content
+      .map(item => item.text || "")
+      .join("");
+  }
+
+  return "";
+}
+
+let lastRequestAt = 0;
+
+async function callAI(prompt, maxTokens = 4500) {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       const elapsed = Date.now() - lastRequestAt;
@@ -125,31 +132,40 @@ async function callGemini(prompt, schema, maxTokens = 5000) {
       }
 
       console.log(
-        `Gemini request: attempt ${attempt}/${MAX_ATTEMPTS}`
+        `OpenRouter request: ${attempt}/${MAX_ATTEMPTS}`
       );
+
+      lastRequestAt = Date.now();
 
       const response = await fetch(API_URL, {
         method: "POST",
         headers: {
+          "Authorization": `Bearer ${API_KEY}`,
           "Content-Type": "application/json",
-          "x-goog-api-key": API_KEY
+          "HTTP-Referer": "https://avenixpro.com",
+          "X-Title": "Avenix Trip"
         },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT),
         body: JSON.stringify({
-          contents: [{
-            role: "user",
-            parts: [{ text: prompt }]
-          }],
-          generationConfig: {
-            temperature: 0.7,
-            responseMimeType: "application/json",
-            responseSchema: schema,
-            maxOutputTokens: maxTokens
+          model: MODEL,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a careful international travel editor. Follow the user's instructions and return valid JSON only."
+            },
+            {
+              role: "user",
+              content: prompt
+            }
+          ],
+          temperature: 0.7,
+          max_tokens: maxTokens,
+          response_format: {
+            type: "json_object"
           }
         })
       });
-
-      lastRequestAt = Date.now();
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -159,103 +175,62 @@ async function callGemini(prompt, schema, maxTokens = 5000) {
         ];
 
         if (temporaryStatuses.includes(response.status)) {
-          throw new Error(
+          const error = new Error(
             `TEMPORARY_HTTP_${response.status}: ${errorText}`
           );
+          error.temporary = true;
+          error.retryAfter = response.headers.get("retry-after");
+          throw error;
         }
 
         throw new Error(
-          `Gemini API error ${response.status}: ${errorText}`
+          `OpenRouter API error ${response.status}: ${errorText}`
         );
       }
 
       const data = await response.json();
+      const content = getMessageContent(data);
 
-      const candidate = data.candidates?.[0];
-
-      const resultText = candidate?.content?.parts
-        ?.map(part => part.text || "")
-        .join("");
-
-      if (!resultText) {
-        throw new Error(
-          `Gemini returned no usable text. Finish reason: ${
-            candidate?.finishReason || "unknown"
-          }`
-        );
+      if (!content) {
+        throw new Error("OpenRouter returned an empty response.");
       }
 
-      return JSON.parse(resultText);
+      return extractJson(content);
 
     } catch (error) {
       const message = String(error.message || error);
 
       const temporary =
-        isTemporaryError(error) ||
-        message.startsWith("TEMPORARY_HTTP_");
+        error.temporary === true ||
+        error.name === "AbortError" ||
+        error.name === "TimeoutError" ||
+        message.includes("fetch failed") ||
+        message.includes("Headers Timeout") ||
+        message.includes("UND_ERR") ||
+        message.includes("ECONNRESET") ||
+        message.includes("ETIMEDOUT") ||
+        message.includes("EAI_AGAIN");
 
       if (!temporary || attempt === MAX_ATTEMPTS) {
         throw error;
       }
 
-      const waitTime = Math.min(
-        15000 * Math.pow(2, attempt - 1),
-        120000
-      );
-
-      const jitter = Math.floor(Math.random() * 5000);
+      const retryHeader = Number(error.retryAfter);
+      const waitTime =
+        retryHeader > 0
+          ? Math.min(retryHeader * 1000, 120000)
+          : 30000;
 
       console.log(
-        `Temporary Gemini/network error. ` +
-        `Retry ${attempt}/${MAX_ATTEMPTS} after ` +
-        `${Math.round((waitTime + jitter) / 1000)} seconds.`
+        `Temporary error. Retrying after ${Math.ceil(waitTime / 1000)} seconds.`
       );
 
-      await sleep(waitTime + jitter);
+      await sleep(waitTime);
     }
   }
 
-  throw new Error("Gemini request failed after all retries.");
+  throw new Error("OpenRouter request failed.");
 }
-
-const topicSchema = {
-  type: "OBJECT",
-  properties: {
-    topics: {
-      type: "ARRAY",
-      items: {
-        type: "OBJECT",
-        properties: {
-          title: { type: "STRING" },
-          slug: { type: "STRING" },
-          category: { type: "STRING" },
-          focus_keyword: { type: "STRING" }
-        },
-        required: [
-          "title",
-          "slug",
-          "category",
-          "focus_keyword"
-        ]
-      }
-    }
-  },
-  required: ["topics"]
-};
-
-const articleSchema = {
-  type: "OBJECT",
-  properties: {
-    description: { type: "STRING" },
-    focus_keyword: { type: "STRING" },
-    article_markdown: { type: "STRING" }
-  },
-  required: [
-    "description",
-    "focus_keyword",
-    "article_markdown"
-  ]
-};
 
 async function main() {
   const existingTitles = getExistingTitles();
@@ -268,40 +243,43 @@ async function main() {
   console.log("Planning new Avenix Trip articles...");
 
   const plannerPrompt = `
-You are the editorial planner for Avenix Trip,
-an international travel guide website.
+Return a JSON object with a "topics" array containing exactly ${DAILY_POSTS} article ideas.
 
-Create exactly ${DAILY_POSTS} distinct, useful,
-evergreen article ideas.
+You are the editorial planner for Avenix Trip, an international travel guide website.
 
-Existing article titles (avoid duplicates):
+Existing article titles:
 ${existingTitles.join("\n")}
 
 Allowed categories:
 ${CATEGORIES.join(", ")}
 
+Each topic must contain:
+- title
+- slug
+- category
+- focus_keyword
+
 Rules:
-- Focus on international travel, flights, airports,
-  destinations, travel planning, accommodation,
-  transport and visa preparation.
-- Avoid invented visa rules, fees, prices or airline policies.
-- Prefer topics answerable with reliable general guidance.
-- Avoid thin, repetitive or misleading topics.
-- Every title must be meaningfully different.
-- Use short, readable, lowercase URL slugs.
-- Choose only an allowed category.
-- Return exactly ${DAILY_POSTS} topics.
+- Write useful evergreen international travel topics.
+- Cover flights, airports, destinations, visa preparation,
+  accommodation, transport and travel planning.
+- Avoid duplicate or closely related titles.
+- Avoid invented visa rules, fees and current prices.
+- Use short lowercase URL slugs.
+- Use only the allowed categories.
+- Make every topic meaningfully different.
+- Return valid JSON only.
 `;
 
-  const plan = await callGemini(
-    plannerPrompt,
-    topicSchema,
-    5000
-  );
+  const plan = await callAI(plannerPrompt, 5000);
+
+  if (!Array.isArray(plan.topics)) {
+    throw new Error("Topic planner returned no topics array.");
+  }
 
   const plannedSlugs = new Set();
 
-  const topics = (plan.topics || [])
+  const topics = plan.topics
     .map(topic => ({
       ...topic,
       slug: slugify(topic.slug || topic.title),
@@ -322,9 +300,7 @@ Rules:
         existingSlugs.has(topic.slug) ||
         plannedSlugs.has(topic.slug) ||
         titleSet.has(normalizedTitle)
-      ) {
-        return false;
-      }
+      ) return false;
 
       plannedSlugs.add(topic.slug);
       titleSet.add(normalizedTitle);
@@ -342,34 +318,33 @@ Rules:
 
     try {
       const prompt = `
-Write a high-quality English travel guide for Avenix Trip.
+Return a JSON object with these fields:
+- description
+- focus_keyword
+- article_markdown
 
-Article title: ${topic.title}
+Write an original, useful English travel guide for Avenix Trip.
+
+Title: ${topic.title}
 Primary keyword: ${topic.focus_keyword}
 
 Requirements:
-- Aim for approximately 800–1,000 useful words.
+- Aim for 800–1,000 useful words.
 - Write naturally for international travellers.
-- Use a clear H1 title and useful H2/H3 headings.
-- Include a helpful introduction and practical steps.
-- Include a relevant FAQ and useful conclusion.
+- Start the article body with a useful introduction.
+- Use relevant H2 and H3 headings.
+- Include practical advice and clear steps.
+- Include a relevant FAQ and conclusion.
 - Avoid keyword stuffing and repetitive paragraphs.
-- Do not invent facts, official policies, visa fees
-  or current prices.
-- For visa, immigration, baggage and airline rules,
-  tell readers to verify current information with
-  the relevant official authority.
-- Do not invent sources, quotations, statistics or links.
-- Do not mention that the article was AI-generated.
-- Return original, useful content, not a template.
-- Return the article body in Markdown.
+- Do not invent facts, statistics, quotations, sources,
+  official policies, visa fees or current prices.
+- Tell readers to verify changing visa, immigration,
+  airline and baggage rules with official authorities.
+- Do not mention AI generation.
+- Return valid JSON only.
 `;
 
-      const article = await callGemini(
-        prompt,
-        articleSchema,
-        8000
-      );
+      const article = await callAI(prompt, 5000);
 
       const description = String(
         article.description || ""
@@ -388,9 +363,7 @@ Requirements:
         !body ||
         body.split(/\s+/).length < 400
       ) {
-        console.log(
-          `Skipping incomplete article: ${topic.title}`
-        );
+        console.log(`Incomplete article: ${topic.title}`);
         failed++;
         continue;
       }
@@ -411,7 +384,6 @@ Requirements:
         `${frontmatter}# ${topic.title}\n\n${body}\n`;
 
       const folder = path.join(ROOT, topic.category);
-
       fs.mkdirSync(folder, { recursive: true });
 
       const filePath = path.join(
@@ -433,7 +405,6 @@ Requirements:
 
     } catch (error) {
       failed++;
-
       console.error(`Article failed: ${topic.title}`);
       console.error(error.message);
     }
@@ -441,12 +412,12 @@ Requirements:
 
   console.log("--------------------------------");
   console.log(`Articles created: ${created}`);
-  console.log(`Articles failed/skipped: ${failed}`);
+  console.log(`Articles failed: ${failed}`);
   console.log("--------------------------------");
 
   if (created === 0) {
     throw new Error(
-      "No articles were created. Check Gemini API availability and quota."
+      "No articles were created. Check OpenRouter availability and free quota."
     );
   }
 
