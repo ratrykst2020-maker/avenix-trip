@@ -1,4 +1,3 @@
-
 ---
 title: "Jakarta to London via Doha: Qatar Airways Flight Guide"
 description: "Explore flights from Jakarta to London via Doha, including Qatar Airways connections, baggage rules, transit information and UK visa guidance."
