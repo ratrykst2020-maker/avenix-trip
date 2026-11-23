@@ -6,6 +6,7 @@ const { marked } = require("marked");
 
 const ROOT = __dirname;
 const DIST = path.join(ROOT, "dist");
+const SITE_URL = "https://avenixpro.com";
 
 marked.setOptions({
   gfm: true,
@@ -34,6 +35,75 @@ function slugify(value) {
     .replace(/^-+|-+$/g, "");
 }
 
+/*
+ * Cleans common copy-paste mistakes before reading frontmatter:
+ * - UTF-8 BOM
+ * - accidental outer Markdown code fences
+ * - accidental filename heading before frontmatter
+ * - missing opening --- before YAML metadata
+ */
+function cleanMarkdownSource(source, file) {
+  let text = String(source).replace(/^\uFEFF/, "").trim();
+
+  // Remove an accidental outer Markdown code fence.
+  text = text.replace(/^```(?:markdown|md|yaml)?[ \t]*\r?\n/i, "");
+  text = text.replace(/\r?\n```[ \t]*$/, "");
+
+  text = text.trimStart();
+
+  // Remove a filename heading if it appears immediately before frontmatter.
+  text = text.replace(
+    /^#[^\r\n]*\r?\n[ \t]*(?=---[ \t]*\r?$)/m,
+    ""
+  );
+
+  // If YAML fields were pasted without the opening delimiter,
+  // add the delimiter only when a closing delimiter is present.
+  if (!/^---[ \t]*(?:\r?\n|$)/.test(text)) {
+    const metadataStart = /^(title|description|slug|focus_keyword|image|image_alt):[ \t]*/m;
+
+    if (metadataStart.test(text)) {
+      const lines = text.split(/\r?\n/);
+      const closingIndex = lines.findIndex((line, index) =>
+        index > 0 && /^---[ \t]*$/.test(line)
+      );
+
+      if (closingIndex > 0) {
+        text = [
+          "---",
+          ...lines.slice(0, closingIndex),
+          "---",
+          ...lines.slice(closingIndex + 1)
+        ].join("\n");
+      }
+    }
+  }
+
+  return text;
+}
+
+function parseMarkdown(source, file) {
+  const cleaned = cleanMarkdownSource(source, file);
+  const parsed = matter(cleaned);
+
+  const data = parsed.data || {};
+  const content = String(parsed.content || "").trim();
+
+  // Do not allow SEO settings to appear as ordinary article text.
+  const firstContentLine = content.split(/\r?\n/).find(line => line.trim());
+
+  if (
+    firstContentLine &&
+    /^(title|description|slug|focus_keyword|image|image_alt):\s*/i.test(firstContentLine)
+  ) {
+    throw new Error(
+      "SEO metadata is still appearing in the article body. Check frontmatter in: " + file
+    );
+  }
+
+  return { data, content };
+}
+
 function findMarkdownFiles(folder, results = []) {
   if (!fs.existsSync(folder)) return results;
 
@@ -44,7 +114,9 @@ function findMarkdownFiles(folder, results = []) {
       item.name.startsWith(".") ||
       item.name === "node_modules" ||
       item.name === "dist"
-    ) continue;
+    ) {
+      continue;
+    }
 
     const fullPath = path.join(folder, item.name);
 
@@ -62,8 +134,11 @@ function getCategory(file) {
   const relative = path.relative(ROOT, file);
   const firstFolder = relative.split(path.sep)[0];
 
-  return firstFolder === file ? "Travel Guides" :
-    firstFolder.replace(/-/g, " ");
+  if (firstFolder === path.basename(file)) {
+    return "Travel Guides";
+  }
+
+  return firstFolder.replace(/-/g, " ");
 }
 
 function pageTemplate({
@@ -71,7 +146,8 @@ function pageTemplate({
   description,
   canonical,
   content,
-  jsonLd = ""
+  jsonLd = "",
+  pageType = "website"
 }) {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -82,11 +158,13 @@ function pageTemplate({
 <meta name="description" content="${escapeHtml(description)}">
 <link rel="canonical" href="${escapeHtml(canonical)}">
 <meta name="robots" content="index,follow">
-<meta property="og:type" content="article">
+<meta property="og:type" content="${escapeHtml(pageType)}">
 <meta property="og:title" content="${escapeHtml(title)}">
 <meta property="og:description" content="${escapeHtml(description)}">
 <meta property="og:url" content="${escapeHtml(canonical)}">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${escapeHtml(title)}">
+<meta name="twitter:description" content="${escapeHtml(description)}">
 <style>
 *{box-sizing:border-box}
 body{margin:0;font-family:Arial,sans-serif;line-height:1.75;color:#263238;background:#fff}
@@ -120,13 +198,22 @@ function build() {
 
   for (const file of files) {
     const source = fs.readFileSync(file, "utf8");
-    const parsed = matter(source);
-    const data = parsed.data || {};
+    const parsed = parseMarkdown(source, file);
+    const data = parsed.data;
 
-    const title = String(data.title || path.basename(file, ".md"));
-    const description = String(data.description || "");
-    const slug = slugify(data.slug || path.basename(file, ".md"));
+    const filename = path.basename(file, ".md");
+    const title = String(data.title || filename).trim();
+    const description = String(data.description || "").trim();
+    const slug = slugify(data.slug || filename);
     const category = getCategory(file);
+
+    if (!title) {
+      throw new Error("Missing title in " + file);
+    }
+
+    if (!description) {
+      throw new Error("Missing description in " + file);
+    }
 
     if (!slug) {
       throw new Error("Missing or invalid slug in " + file);
@@ -138,25 +225,33 @@ function build() {
 
     usedSlugs.add(slug);
 
-    const url = `https://avenixpro.com/${slug}/`;
-    const image = data.image || "";
-    const imageAlt = data.image_alt || title;
+    const url = `${SITE_URL}/${slug}/`;
+    const image = String(data.image || "").trim();
+    const imageAlt = String(data.image_alt || title).trim();
 
     let imageHtml = "";
+
     if (image) {
-      const imageFile = path.join(ROOT, image.replace(/^\/+/, ""));
+      const imagePath = image.replace(/^\/+/, "");
+      const imageFile = path.join(ROOT, imagePath);
+
       if (fs.existsSync(imageFile)) {
-        imageHtml = `<img class="post-image" src="${escapeHtml(image)}" alt="${escapeHtml(imageAlt)}">`;
+        imageHtml = `<img class="post-image" src="/${escapeHtml(imagePath)}" alt="${escapeHtml(imageAlt)}">`;
       } else {
         console.warn("Image not found:", image);
       }
     }
 
+    // Only parsed.content is converted into visible article HTML.
+    // Frontmatter metadata is never included in this content.
     const articleHtml = marked.parse(parsed.content);
+
     const content = `
+<article>
 <h1>${escapeHtml(title)}</h1>
 ${imageHtml}
 ${articleHtml}
+</article>
 <p><a href="/">Back to Avenix Trip</a></p>`;
 
     const jsonLd = safeJson({
@@ -164,7 +259,11 @@ ${articleHtml}
       "@type": "Article",
       headline: title,
       description,
-      mainEntityOfPage: url,
+      mainEntityOfPage: {
+        "@type": "WebPage",
+        "@id": url
+      },
+      url,
       author: {
         "@type": "Organization",
         name: "Avenix Trip"
@@ -173,7 +272,7 @@ ${articleHtml}
         "@type": "Organization",
         name: "Avenix Trip"
       },
-      ...(image ? { image: `https://avenixpro.com${image}` } : {})
+      ...(image ? { image: `${SITE_URL}/${image.replace(/^\/+/, "")}` } : {})
     });
 
     const outputFolder = path.join(DIST, slug);
@@ -186,8 +285,10 @@ ${articleHtml}
         description,
         canonical: url,
         content,
-        jsonLd
-      })
+        jsonLd,
+        pageType: "article"
+      }),
+      "utf8"
     );
 
     posts.push({
@@ -195,9 +296,10 @@ ${articleHtml}
       description,
       slug,
       category,
-      url,
-      source: file
+      url
     });
+
+    console.log("Generated:", url);
   }
 
   posts.sort((a, b) => a.title.localeCompare(b.title));
@@ -222,13 +324,14 @@ ${postLinks || "<p>New travel guides are coming soon.</p>"}
     pageTemplate({
       title: "Avenix Trip | Travel Guides, Flights & Travel Tips",
       description: "Explore flight guides, destination advice, visa information and travel tips with Avenix Trip.",
-      canonical: "https://avenixpro.com/",
+      canonical: `${SITE_URL}/`,
       content: homepage
-    })
+    }),
+    "utf8"
   );
 
   const sitemapUrls = [
-    "https://avenixpro.com/",
+    `${SITE_URL}/`,
     ...posts.map(post => post.url)
   ];
 
@@ -237,11 +340,20 @@ ${postLinks || "<p>New travel guides are coming soon.</p>"}
 ${sitemapUrls.map(url => `<url><loc>${escapeHtml(url)}</loc></url>`).join("\n")}
 </urlset>`;
 
-  fs.writeFileSync(path.join(DIST, "sitemap.xml"), sitemap);
+  fs.writeFileSync(
+    path.join(DIST, "sitemap.xml"),
+    sitemap,
+    "utf8"
+  );
 
   fs.writeFileSync(
     path.join(DIST, "robots.txt"),
-    "User-agent: *\nAllow: /\n\nSitemap: https://avenixpro.com/sitemap.xml\n"
+    `User-agent: *
+Allow: /
+
+Sitemap: ${SITE_URL}/sitemap.xml
+`,
+    "utf8"
   );
 
   fs.writeFileSync(
@@ -249,12 +361,14 @@ ${sitemapUrls.map(url => `<url><loc>${escapeHtml(url)}</loc></url>`).join("\n")}
     pageTemplate({
       title: "Page Not Found | Avenix Trip",
       description: "The requested page could not be found.",
-      canonical: "https://avenixpro.com/404.html",
+      canonical: `${SITE_URL}/404.html`,
       content: "<h1>Page Not Found</h1><p>The page you requested does not exist.</p><a href='/'>Return to Homepage</a>"
-    })
+    }),
+    "utf8"
   );
 
   const imagesFolder = path.join(ROOT, "images");
+
   if (fs.existsSync(imagesFolder)) {
     fs.cpSync(imagesFolder, path.join(DIST, "images"), {
       recursive: true
